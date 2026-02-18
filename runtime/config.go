@@ -41,6 +41,6 @@ func NewDefaultConfig() *Config {
 		ContactsIndex:     "contacts",
 		ContactsShards:    2,
 		ContactsReplicas:  1,
-		ContactsBatchSize: 500,
+		ContactsBatchSize: 10000,
 	}
 }
