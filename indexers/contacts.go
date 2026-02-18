@@ -112,21 +112,21 @@ SELECT org_id, id, modified_on, is_active, row_to_json(t) FROM (
 		(
 			SELECT jsonb_agg(f.value)
 			FROM (
-				SELECT 
+				SELECT
 					CASE
 					WHEN value ? 'ward'
 					THEN jsonb_build_object('ward_keyword', trim(substring(value ->> 'ward' from  '(?!.* > )([^>]+)')))
 					ELSE '{}'::jsonb
 					END || district_value.value AS value
 				FROM (
-					SELECT 
+					SELECT
 						CASE
 						WHEN value ? 'district'
 						THEN jsonb_build_object('district_keyword', trim(substring(value ->> 'district' from  '(?!.* > )([^>]+)')))
 						ELSE '{}'::jsonb
 						END || state_value.value as value
 					FROM (
-						SELECT 
+						SELECT
 							CASE
 							WHEN value ? 'state'
 							THEN jsonb_build_object('state_keyword', trim(substring(value ->> 'state' from  '(?!.* > )([^>]+)')))
@@ -138,8 +138,8 @@ SELECT org_id, id, modified_on, is_active, row_to_json(t) FROM (
 			) AS f
 		) AS fields,
 		(
-			SELECT array_to_json(array_agg(gc.contactgroup_id)) 
-			FROM contacts_contactgroup_contacts gc 
+			SELECT array_to_json(array_agg(gc.contactgroup_id))
+			FROM contacts_contactgroup_contacts gc
 			INNER JOIN contacts_contactgroup g ON g.id = gc.contactgroup_id
 			WHERE gc.contact_id = contacts_contact.id AND g.group_type IN ('M', 'Q')
 		) AS group_ids,
@@ -148,9 +148,9 @@ SELECT org_id, id, modified_on, is_active, row_to_json(t) FROM (
 			SELECT array_to_json(array_agg(DISTINCT fr.flow_id)) FROM flows_flowrun fr WHERE fr.contact_id = contacts_contact.id
 		) AS flow_history_ids
 	FROM contacts_contact
-	WHERE modified_on >= $1
-	ORDER BY modified_on ASC
-	LIMIT 100000
+	WHERE (modified_on > $1) OR (modified_on = $1 AND id > $2)
+	ORDER BY modified_on ASC, id ASC
+	LIMIT $3
 ) t;
 `
 
@@ -162,36 +162,19 @@ func (i *ContactIndexer) indexModified(ctx context.Context, db *sql.DB, index st
 	var contactJSON string
 	var id, orgID int64
 	var isActive bool
+	var lastID int64
 
-	subBatch := &bytes.Buffer{}
+	batch := &bytes.Buffer{}
 	start := time.Now()
 
 	for {
-		batchStart := time.Now()        // start time for this batch
-		batchFetched := 0               // contacts fetched in this batch
-		batchCreated := 0               // contacts created in ES
-		batchUpdated := 0               // contacts updated in ES
-		batchDeleted := 0               // contacts deleted in ES
-		batchESTime := time.Duration(0) // time spent indexing for this batch
+		batchStart := time.Now()
+		batchFetched := 0
+		batchCreated := 0
+		batchUpdated := 0
+		batchDeleted := 0
 
-		indexSubBatch := func(b *bytes.Buffer) error {
-			t := time.Now()
-			created, updated, deleted, err := i.indexBatch(index, b.Bytes())
-			if err != nil {
-				return err
-			}
-
-			batchESTime += time.Since(t)
-			batchCreated += created
-			batchUpdated += updated
-			batchDeleted += deleted
-			b.Reset()
-			return nil
-		}
-
-		rows, err := db.QueryContext(ctx, sqlSelectModifiedContacts, lastModified)
-
-		queryModified := lastModified
+		rows, err := db.QueryContext(ctx, sqlSelectModifiedContacts, lastModified, lastID, i.batchSize)
 
 		// no more rows? return
 		if err == sql.ErrNoRows {
@@ -200,46 +183,44 @@ func (i *ContactIndexer) indexModified(ctx context.Context, db *sql.DB, index st
 		if err != nil {
 			return err
 		}
-		defer rows.Close()
 
 		for rows.Next() {
 			err = rows.Scan(&orgID, &id, &modifiedOn, &isActive, &contactJSON)
 			if err != nil {
+				rows.Close()
 				return err
 			}
 
 			batchFetched++
 			lastModified = modifiedOn
+			lastID = id
 
 			if isActive {
 				i.log().Debug("modified contact", "id", id, "modifiedOn", modifiedOn, "contact", contactJSON)
 
-				subBatch.WriteString(fmt.Sprintf(indexCommand, id, modifiedOn.UnixNano(), orgID))
-				subBatch.WriteString("\n")
-				subBatch.WriteString(contactJSON)
-				subBatch.WriteString("\n")
+				batch.WriteString(fmt.Sprintf(indexCommand, id, modifiedOn.UnixNano(), orgID))
+				batch.WriteString("\n")
+				batch.WriteString(contactJSON)
+				batch.WriteString("\n")
 			} else {
 				i.log().Debug("deleted contact", "id", id, "modifiedOn", modifiedOn)
 
-				subBatch.WriteString(fmt.Sprintf(deleteCommand, id, modifiedOn.UnixNano(), orgID))
-				subBatch.WriteString("\n")
-			}
-
-			// write to elastic search in batches
-			if batchFetched%i.batchSize == 0 {
-				if err := indexSubBatch(subBatch); err != nil {
-					return err
-				}
+				batch.WriteString(fmt.Sprintf(deleteCommand, id, modifiedOn.UnixNano(), orgID))
+				batch.WriteString("\n")
 			}
 		}
+		rows.Close()
 
-		if subBatch.Len() > 0 {
-			if err := indexSubBatch(subBatch); err != nil {
+		if batch.Len() > 0 {
+			created, updated, deleted, err := i.indexBatch(index, batch.Bytes())
+			if err != nil {
 				return err
 			}
+			batchCreated = created
+			batchUpdated = updated
+			batchDeleted = deleted
+			batch.Reset()
 		}
-
-		rows.Close()
 
 		totalFetched += batchFetched
 		totalCreated += batchCreated
@@ -256,24 +237,22 @@ func (i *ContactIndexer) indexModified(ctx context.Context, db *sql.DB, index st
 			"batch_created", batchCreated,
 			"batch_updated", batchUpdated,
 			"batch_elapsed", batchTime,
-			"batch_elapsed_es", batchESTime,
 			"total_fetched", totalFetched,
 			"total_created", totalCreated,
 			"total_updated", totalUpdated,
 			"total_elapsed", totalTime,
 		)
 
-		// if we're rebuilding, always log batch progress
-		if rebuild {
+		if batchFetched > 0 {
 			log.Info("indexed contact batch")
 		} else {
 			log.Debug("indexed contact batch")
 		}
 
-		i.recordActivity(batchCreated+batchUpdated, batchDeleted, time.Since(batchStart))
+		i.recordActivity(batchCreated+batchUpdated, batchDeleted, batchTime)
 
-		// last modified stayed the same and we didn't add anything, seen it all, break out
-		if lastModified.Equal(queryModified) && batchCreated == 0 {
+		// if we got fewer rows than our page size, we've exhausted available records
+		if batchFetched < i.batchSize {
 			break
 		}
 	}

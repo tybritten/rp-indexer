@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nyaruka/gocommon/jsonx"
@@ -66,6 +67,7 @@ type baseIndexer struct {
 	name       string // e.g. contacts, used as the alias
 	definition *IndexDefinition
 
+	mu    sync.Mutex
 	stats Stats
 }
 
@@ -78,6 +80,8 @@ func (i *baseIndexer) Name() string {
 }
 
 func (i *baseIndexer) Stats() Stats {
+	i.mu.Lock()
+	defer i.mu.Unlock()
 	return i.stats
 }
 
@@ -87,11 +91,13 @@ func (i *baseIndexer) log() *slog.Logger {
 
 // records indexing activity and updates statistics
 func (i *baseIndexer) recordActivity(indexed, deleted int, elapsed time.Duration) {
+	i.mu.Lock()
 	i.stats.Indexed += int64(indexed)
 	i.stats.Deleted += int64(deleted)
 	i.stats.Elapsed += elapsed
+	i.mu.Unlock()
 
-	i.log().Info("completed indexing", "indexed", indexed, "deleted", deleted, "elapsed", elapsed)
+	i.log().Debug("completed indexing", "indexed", indexed, "deleted", deleted, "elapsed", elapsed)
 }
 
 // our response for figuring out the physical index for an alias
@@ -272,6 +278,7 @@ func (i *baseIndexer) indexBatch(index string, batch []byte) (int, int, int, err
 	response := indexResponse{}
 	indexURL := fmt.Sprintf("%s/%s/_bulk", i.elasticURL, index)
 
+
 	_, err := utils.MakeJSONRequest(http.MethodPut, indexURL, batch, &response)
 	if err != nil {
 		return 0, 0, 0, err
@@ -303,7 +310,8 @@ func (i *baseIndexer) indexBatch(index string, batch []byte) (int, int, int, err
 		}
 	}
 
-	slog.Debug("indexed batch", "created", createdCount, "updated", updatedCount, "deleted", deletedCount, "conflicted", conflictedCount)
+	totalProcessed := createdCount + updatedCount + deletedCount
+	i.log().Info("batch completed", "total_contacts", totalProcessed, "created", createdCount, "updated", updatedCount, "deleted", deletedCount, "conflicted", conflictedCount)
 
 	return createdCount, updatedCount, deletedCount, nil
 }
