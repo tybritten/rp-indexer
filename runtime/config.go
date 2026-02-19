@@ -16,10 +16,9 @@ type Config struct {
 	CloudwatchNamespace string `help:"the namespace to use for cloudwatch metrics"`
 	DeploymentID        string `help:"the deployment identifier to use for metrics"`
 
-	ContactsIndex     string `help:"the alias to use for the contact index"`
-	ContactsShards    int    `help:"the number of shards to use for the contacts index"`
-	ContactsReplicas  int    `help:"the number of replicas to use for the contacts index"`
-	ContactsBatchSize int    `help:"the number of contacts to fetch from the database and index in each Elasticsearch batch"`
+	ContactsIndex    string `help:"the alias to use for the contact index"`
+	ContactsShards   int    `help:"the number of shards to use for the contacts index"`
+	ContactsReplicas int    `help:"the number of replicas to use for the contacts index"`
 }
 
 func NewDefaultConfig() *Config {
@@ -38,9 +37,8 @@ func NewDefaultConfig() *Config {
 		CloudwatchNamespace: "Temba/Indexer",
 		DeploymentID:        "dev",
 
-		ContactsIndex:     "contacts",
-		ContactsShards:    2,
-		ContactsReplicas:  1,
-		ContactsBatchSize: 10000,
+		ContactsIndex:    "contacts",
+		ContactsShards:   2,
+		ContactsReplicas: 1,
 	}
 }

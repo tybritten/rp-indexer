@@ -81,7 +81,7 @@ func main() {
 	}
 
 	idxrs := []indexers.Indexer{
-		indexers.NewContactIndexer(rt.Config.ElasticURL, rt.Config.ContactsIndex, rt.Config.ContactsShards, rt.Config.ContactsReplicas, rt.Config.ContactsBatchSize),
+		indexers.NewContactIndexer(rt.Config.ElasticURL, rt.Config.ContactsIndex, rt.Config.ContactsShards, rt.Config.ContactsReplicas, 500),
 	}
 
 	if rt.Config.Rebuild {

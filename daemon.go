@@ -13,7 +13,6 @@ import (
 	"github.com/nyaruka/rp-indexer/v9/runtime"
 )
 
-
 type Daemon struct {
 	rt       *runtime.Runtime
 	wg       *sync.WaitGroup
@@ -132,18 +131,13 @@ func (d *Daemon) reportStats(includeLag bool) {
 				metrics = append(metrics, cwatch.Datum("IndexingLag", lag.Seconds(), types.StandardUnitSeconds, idxDim))
 			}
 		}
-
-		log.Info("stats reported",
-			"indexer", ix.Name(),
-			"indexed", indexedInPeriod,
-			"deleted", deletedInPeriod,
-			"rate_per_s", fmt.Sprintf("%.1f", rateInPeriod),
-		)
 	}
 
 	if err := d.rt.CW.Send(ctx, metrics...); err != nil {
 		log.Error("error putting metrics", "error", err)
 	}
+
+	log.Info("stats reported")
 }
 
 func (d *Daemon) calculateLag(ctx context.Context, ix indexers.Indexer) (time.Duration, error) {
