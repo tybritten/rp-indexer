@@ -148,9 +148,9 @@ SELECT org_id, id, modified_on, is_active, row_to_json(t) FROM (
 			SELECT array_to_json(array_agg(DISTINCT fr.flow_id)) FROM flows_flowrun fr WHERE fr.contact_id = contacts_contact.id
 		) AS flow_history_ids
 	FROM contacts_contact
-	WHERE (modified_on > $1) OR (modified_on = $1 AND id > $2)
+	WHERE (modified_on, id) > ($1, $2)
 	ORDER BY modified_on ASC, id ASC
-	LIMIT $3
+	LIMIT 100000
 ) t;
 `
 
@@ -164,17 +164,33 @@ func (i *ContactIndexer) indexModified(ctx context.Context, db *sql.DB, index st
 	var isActive bool
 	var lastID int64
 
-	batch := &bytes.Buffer{}
+	subBatch := &bytes.Buffer{}
 	start := time.Now()
 
 	for {
-		batchStart := time.Now()
-		batchFetched := 0
-		batchCreated := 0
-		batchUpdated := 0
-		batchDeleted := 0
+		batchStart := time.Now()        // start time for this batch
+		batchFetched := 0               // contacts fetched in this batch
+		batchCreated := 0               // contacts created in ES
+		batchUpdated := 0               // contacts updated in ES
+		batchDeleted := 0               // contacts deleted in ES
+		batchESTime := time.Duration(0) // time spent indexing for this batch
 
-		rows, err := db.QueryContext(ctx, sqlSelectModifiedContacts, lastModified, lastID, i.batchSize)
+		indexSubBatch := func(b *bytes.Buffer) error {
+			t := time.Now()
+			created, updated, deleted, err := i.indexBatch(index, b.Bytes())
+			if err != nil {
+				return err
+			}
+
+			batchESTime += time.Since(t)
+			batchCreated += created
+			batchUpdated += updated
+			batchDeleted += deleted
+			b.Reset()
+			return nil
+		}
+
+		rows, err := db.QueryContext(ctx, sqlSelectModifiedContacts, lastModified, lastID)
 
 		// no more rows? return
 		if err == sql.ErrNoRows {
@@ -198,28 +214,31 @@ func (i *ContactIndexer) indexModified(ctx context.Context, db *sql.DB, index st
 			if isActive {
 				i.log().Debug("modified contact", "id", id, "modifiedOn", modifiedOn, "contact", contactJSON)
 
-				batch.WriteString(fmt.Sprintf(indexCommand, id, modifiedOn.UnixNano(), orgID))
-				batch.WriteString("\n")
-				batch.WriteString(contactJSON)
-				batch.WriteString("\n")
+				subBatch.WriteString(fmt.Sprintf(indexCommand, id, modifiedOn.UnixNano(), orgID))
+				subBatch.WriteString("\n")
+				subBatch.WriteString(contactJSON)
+				subBatch.WriteString("\n")
 			} else {
 				i.log().Debug("deleted contact", "id", id, "modifiedOn", modifiedOn)
 
-				batch.WriteString(fmt.Sprintf(deleteCommand, id, modifiedOn.UnixNano(), orgID))
-				batch.WriteString("\n")
+				subBatch.WriteString(fmt.Sprintf(deleteCommand, id, modifiedOn.UnixNano(), orgID))
+				subBatch.WriteString("\n")
+			}
+
+			// write to elastic search in batches
+			if batchFetched%i.batchSize == 0 {
+				if err := indexSubBatch(subBatch); err != nil {
+					rows.Close()
+					return err
+				}
 			}
 		}
 		rows.Close()
 
-		if batch.Len() > 0 {
-			created, updated, deleted, err := i.indexBatch(index, batch.Bytes())
-			if err != nil {
+		if subBatch.Len() > 0 {
+			if err := indexSubBatch(subBatch); err != nil {
 				return err
 			}
-			batchCreated = created
-			batchUpdated = updated
-			batchDeleted = deleted
-			batch.Reset()
 		}
 
 		totalFetched += batchFetched
@@ -237,6 +256,7 @@ func (i *ContactIndexer) indexModified(ctx context.Context, db *sql.DB, index st
 			"batch_created", batchCreated,
 			"batch_updated", batchUpdated,
 			"batch_elapsed", batchTime,
+			"batch_elapsed_es", batchESTime,
 			"total_fetched", totalFetched,
 			"total_created", totalCreated,
 			"total_updated", totalUpdated,
@@ -249,10 +269,10 @@ func (i *ContactIndexer) indexModified(ctx context.Context, db *sql.DB, index st
 			log.Debug("indexed contact batch")
 		}
 
-		i.recordActivity(batchCreated+batchUpdated, batchDeleted, batchTime)
+		i.recordActivity(batchCreated+batchUpdated, batchDeleted, time.Since(batchStart))
 
 		// if we got fewer rows than our page size, we've exhausted available records
-		if batchFetched < i.batchSize {
+		if batchFetched < 100000 {
 			break
 		}
 	}
