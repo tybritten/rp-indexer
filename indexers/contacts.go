@@ -192,6 +192,8 @@ func (i *ContactIndexer) indexModified(ctx context.Context, db *sql.DB, index st
 
 		rows, err := db.QueryContext(ctx, sqlSelectModifiedContacts, lastModified, lastID)
 
+		queryModified := lastModified
+
 		// no more rows? return
 		if err == sql.ErrNoRows {
 			return nil
@@ -199,11 +201,11 @@ func (i *ContactIndexer) indexModified(ctx context.Context, db *sql.DB, index st
 		if err != nil {
 			return err
 		}
+		defer rows.Close()
 
 		for rows.Next() {
 			err = rows.Scan(&orgID, &id, &modifiedOn, &isActive, &contactJSON)
 			if err != nil {
-				rows.Close()
 				return err
 			}
 
@@ -228,18 +230,18 @@ func (i *ContactIndexer) indexModified(ctx context.Context, db *sql.DB, index st
 			// write to elastic search in batches
 			if batchFetched%i.batchSize == 0 {
 				if err := indexSubBatch(subBatch); err != nil {
-					rows.Close()
 					return err
 				}
 			}
 		}
-		rows.Close()
 
 		if subBatch.Len() > 0 {
 			if err := indexSubBatch(subBatch); err != nil {
 				return err
 			}
 		}
+
+		rows.Close()
 
 		totalFetched += batchFetched
 		totalCreated += batchCreated
@@ -263,7 +265,8 @@ func (i *ContactIndexer) indexModified(ctx context.Context, db *sql.DB, index st
 			"total_elapsed", totalTime,
 		)
 
-		if batchFetched > 0 {
+		// if we're rebuilding, always log batch progress
+		if rebuild {
 			log.Info("indexed contact batch")
 		} else {
 			log.Debug("indexed contact batch")
@@ -271,8 +274,8 @@ func (i *ContactIndexer) indexModified(ctx context.Context, db *sql.DB, index st
 
 		i.recordActivity(batchCreated+batchUpdated, batchDeleted, time.Since(batchStart))
 
-		// if we got fewer rows than our page size, we've exhausted available records
-		if batchFetched < 100000 {
+		// last modified stayed the same and we didn't add anything, seen it all, break out
+		if lastModified.Equal(queryModified) && batchCreated == 0 {
 			break
 		}
 	}
